@@ -1,7 +1,19 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "dash",
+#     "dash-ag-grid",
+#     "dash-bootstrap-components",
+#     "openai",
+#     "pandas",
+#     "python-dotenv",
+# ]
+# ///
 import base64
 import io
 import json
 import os
+import pathlib
 
 import dash
 import dash_ag_grid as dag
@@ -12,11 +24,104 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 from collections import deque
 from datetime import datetime
+from dotenv import load_dotenv
 
-from data_rip.prompts import FUNCTION_CALLING_FEW_SHOTS_DICT, FUNCTION_CALLING_SYS_PROMPT
+# Load environment variables from .env file if it exists
+# Check multiple locations for .env file
+env_locations = [
+    pathlib.Path.cwd() / '.env',  # Current working directory
+    pathlib.Path(__file__).parent.parent / '.env',  # Project root directory
+]
 
-# Initialize the OpenAI API
-client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
+for env_path in env_locations:
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        break
+
+# Prompts for function calling schema generation
+FUNCTION_CALLING_SYS_PROMPT = {
+    "role": "system",
+    "content": """
+# Instructions
+You are a highly detailed researcher, who is trying to extract information from a large dataset.
+
+You will be provided with high level instructions of what data to extract, and you are responsible
+for creating JSON schema definitions for functions to extract the information you need.
+""",
+}
+
+FUNCTION_CALLING_FEW_SHOTS_DICT = [
+    {"role": "user", "content": "I need to extract the total population of all countries."},
+    {
+        "role": "assistant",
+        "content": "{'properties': {'country': {'title': 'Country', 'type': 'string'}, 'population': {'title': 'Population', 'type': 'integer'}}, 'required': ['country', 'population'], 'title': 'CountryPopulation', 'type': 'object'}",
+    },
+    {
+        "role": "user",
+        "content": "I need to extract information about users. I want their id, name, signup timestamp and friends. Default name can be John Doe",
+    },
+    {
+        "role": "assistant",
+        "content": "{'properties': {'id': {'title': 'Id', 'type': 'integer'}, 'name': {'default': 'John Doe', 'title': 'Name', 'type': 'string'}, 'signup_ts': {'default': None, 'format': 'date-time', 'title': 'Signup Ts', 'type': 'string'}, 'friends': {'default': [], 'items': {'type': 'integer'}, 'title': 'Friends', 'type': 'array'}}, 'required': ['id'], 'title': 'User', 'type': 'object'}}",
+    },
+    {
+        "role": "user",
+        "content": "I need to extract information about survey responses, I want to extract a user name, their phone number if present, their satisfaction score, their criticisms. Make sure their satisfaction score is 1<=score<=10",
+    },
+    {
+        "role": "assistant",
+        "content": "{'properties': {'user_name': {'title': 'User Name', 'type': 'string'}, 'phone_number': {'default': None, 'title': 'Phone Number', 'type': 'string'}, 'satisfaction_score': {'title': 'Satisfaction Score', 'type': 'integer'}, 'criticisms': {'items': {'type': 'string'}, 'title': 'Criticisms', 'type': 'array'}}, 'required': ['user_name', 'satisfaction_score', 'criticisms'], 'title': 'SurveyResponse', 'type': 'object'}",
+    },
+]
+
+# OpenAI client factory
+def get_openai_client():
+    # Check whether to use Azure OpenAI or regular OpenAI
+    use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
+    
+    if use_azure:
+        # Azure OpenAI configuration
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-12-01-preview")
+        
+        # Verify required Azure settings
+        if not api_key or not endpoint:
+            raise ValueError("AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set when using Azure OpenAI")
+            
+        return openai.AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=api_version
+        )
+    else:
+        # Standard OpenAI configuration
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")  # Optional, for custom deployments
+        
+        # Verify required settings
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY must be set")
+            
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+            
+        return openai.Client(**client_kwargs)
+
+# Model name mapping for Azure OpenAI deployments
+def get_model_name(base_model_name):
+    # Azure deployments may use different model names
+    azure_model_mapping = {
+        "gpt-4o": os.getenv("AZURE_GPT4O_DEPLOYMENT_NAME", "gpt-4o"),
+        "gpt-4o-mini": os.getenv("AZURE_GPT4O_MINI_DEPLOYMENT_NAME", "gpt-4o-mini"),
+    }
+    
+    use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
+    return azure_model_mapping.get(base_model_name, base_model_name) if use_azure else base_model_name
+
+# Initialize the OpenAI API client
+client = get_openai_client()
 
 # Initialize the Dash app
 app = dash.Dash(
@@ -24,10 +129,24 @@ app = dash.Dash(
     external_stylesheets=[
         dbc.themes.CYBORG,
         "https://use.fontawesome.com/releases/v5.15.4/css/all.css"
-    ]  # Using CYBORG as base theme for dark mode and Font Awesome for icons
+    ],  # Using CYBORG as base theme for dark mode and Font Awesome for icons
+    assets_folder=str(pathlib.Path(__file__).parent / "assets")
 )
 
 # Define custom styles
+# Standard dark mode color palette
+COLORS = {
+    'background': '#121212',
+    'surface': '#1E1E1E',
+    'primary': '#BB86FC',
+    'secondary': '#03DAC6',
+    'accent': '#3700B3',
+    'error': '#CF6679',
+    'text': '#FFFFFF',
+    'text_secondary': '#B0B0B0'
+}
+
+# Keep original colors as reference
 VAPORWAVE_COLORS = {
     'background': '#000033',
     'primary': '#FF71CE',
@@ -53,9 +172,10 @@ ASCII_HEADER = """
 app.layout = dbc.Container(
     fluid=True,
     style={
-        'background': f'linear-gradient(45deg, {VAPORWAVE_COLORS["background"]}, #330033)',
+        'background': COLORS['background'],
         'minHeight': '100vh',
-        'color': VAPORWAVE_COLORS['text']
+        'color': COLORS['text'],
+        'fontFamily': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
     },
     children=[
         # ASCII Art Header
@@ -64,12 +184,12 @@ app.layout = dbc.Container(
                 html.Pre(
                     ASCII_HEADER,
                     style={
-                        'color': VAPORWAVE_COLORS['primary'],
+                        'color': COLORS['primary'],
                         'textAlign': 'center',
                         'fontFamily': 'monospace',
                         'whiteSpace': 'pre',
                         'margin': '20px 0',
-                        'textShadow': f'2px 2px {VAPORWAVE_COLORS["secondary"]}',
+                        'textShadow': f'2px 2px {COLORS["accent"]}',
                         'fontSize': '0.7em',
                         'letterSpacing': '1px',
                         'animation': 'glow 1.5s ease-in-out infinite alternate'
@@ -87,64 +207,53 @@ app.layout = dbc.Container(
                             html.H5(
                                 "Enter detailed instructions for what types of question you want answered",
                                 style={
-                                    'color': VAPORWAVE_COLORS['primary'],
-                                    'textShadow': f'2px 2px {VAPORWAVE_COLORS["secondary"]}',
-                                    'fontFamily': '"Press Start 2P", cursive',
+                                    'color': COLORS['primary'],
+                                    'fontWeight': '500',
                                     'marginBottom': '20px'
                                 }
                             ),
                             dcc.Textarea(
                                 id="input-box",
-                                placeholder="Enter something...",
+                                placeholder="Enter extraction instructions...",
                                 value="I want to extract user names, and ids from this data",
                                 style={
                                     'width': '100%',
                                     'height': '200px',
                                     'resize': 'vertical',
                                     'marginBottom': '20px',
-                                    'background': 'rgba(0, 0, 51, 0.7)',
-                                    'color': VAPORWAVE_COLORS['text'],
-                                    'border': f'2px solid {VAPORWAVE_COLORS["secondary"]}',
-                                    'borderRadius': '5px',
-                                    'padding': '10px'
+                                    'background': COLORS['surface'],
+                                    'color': COLORS['text'],
+                                    'border': f'1px solid {COLORS["accent"]}',
+                                    'borderRadius': '4px',
+                                    'padding': '10px',
+                                    'fontFamily': 'inherit'
                                 }
                             ),
                             html.Button(
-                                "Submit", 
+                                "Generate Schema", 
                                 id="submit-fewshot-instruct",
                                 style={
-                                    'backgroundColor': VAPORWAVE_COLORS['primary'],
+                                    'backgroundColor': COLORS['primary'],
                                     'border': 'none',
-                                    'color': 'white',
+                                    'color': '#000',
                                     'padding': '10px 20px',
-                                    'borderRadius': '5px',
-                                    'marginBottom': '10px',
+                                    'borderRadius': '4px',
+                                    'marginBottom': '15px',
                                     'width': '100%',
-                                    'boxShadow': f'3px 3px {VAPORWAVE_COLORS["secondary"]}',
+                                    'fontWeight': '500',
+                                    'cursor': 'pointer',
+                                    'transition': 'all 0.2s ease'
                                 }
                             ),
                             html.Div(id="output-box"),
                             dcc.Store(id="data-store"),
-                            html.Button(
-                                "Run Structured Extraction", 
-                                id="run-extraction-button",
-                                style={
-                                    'backgroundColor': VAPORWAVE_COLORS['secondary'],
-                                    'border': 'none',
-                                    'color': 'white',
-                                    'padding': '10px 20px',
-                                    'borderRadius': '5px',
-                                    'width': '100%',
-                                    'boxShadow': f'3px 3px {VAPORWAVE_COLORS["primary"]}',
-                                }
-                            ),
                         ],
                         style={
                             "padding": "20px",
-                            "background": "rgba(0, 0, 51, 0.5)",
-                            "borderRadius": "10px",
-                            "backdropFilter": "blur(5px)",
-                            "border": f"1px solid {VAPORWAVE_COLORS['accent']}"
+                            "background": COLORS['surface'],
+                            "borderRadius": "8px",
+                            "boxShadow": "0 4px 6px rgba(0, 0, 0, 0.1)",
+                            "border": f"1px solid {COLORS['accent']}"
                         },
                     )
                 ],
@@ -159,7 +268,7 @@ app.layout = dbc.Container(
                                 id="upload-data",
                                 children=html.Div([
                                     "Drag and Drop or ", 
-                                    html.A("Select CSV Files", style={'color': VAPORWAVE_COLORS['primary']})
+                                    html.A("Select CSV Files", style={'color': COLORS['primary']})
                                 ]),
                                 style={
                                     "width": "100%",
@@ -167,11 +276,11 @@ app.layout = dbc.Container(
                                     "lineHeight": "60px",
                                     "borderWidth": "2px",
                                     "borderStyle": "dashed",
-                                    "borderColor": VAPORWAVE_COLORS['secondary'],
-                                    "borderRadius": "5px",
+                                    "borderColor": COLORS['secondary'],
+                                    "borderRadius": "4px",
                                     "textAlign": "center",
-                                    "margin": "10px",
-                                    "background": "rgba(0, 0, 51, 0.7)",
+                                    "margin": "10px 0 20px 0",
+                                    "background": f"rgba(3, 218, 198, 0.1)",
                                 },
                                 multiple=False,
                             ),
@@ -179,7 +288,7 @@ app.layout = dbc.Container(
                                 dbc.Col(
                                     html.Label(
                                         "ID column",
-                                        style={'color': VAPORWAVE_COLORS['primary']}
+                                        style={'color': COLORS['primary'], 'fontWeight': '500'}
                                     ), 
                                     width=6
                                 ),
@@ -191,8 +300,9 @@ app.layout = dbc.Container(
                                         ],
                                         value="upload-file",
                                         style={
-                                            'backgroundColor': 'rgba(0, 0, 51, 0.7)',
-                                            'color': VAPORWAVE_COLORS['text']
+                                            'backgroundColor': COLORS['surface'],
+                                            'color': COLORS['text'],
+                                            'border': f'1px solid {COLORS["accent"]}'
                                         }
                                     ),
                                     width=6,
@@ -202,7 +312,7 @@ app.layout = dbc.Container(
                                 dbc.Col(
                                     html.Label(
                                         "Text column",
-                                        style={'color': VAPORWAVE_COLORS['primary']}
+                                        style={'color': COLORS['primary'], 'fontWeight': '500'}
                                     ), 
                                     width=6
                                 ),
@@ -214,8 +324,9 @@ app.layout = dbc.Container(
                                         ],
                                         value="upload-file",
                                         style={
-                                            'backgroundColor': 'rgba(0, 0, 51, 0.7)',
-                                            'color': VAPORWAVE_COLORS['text']
+                                            'backgroundColor': COLORS['surface'],
+                                            'color': COLORS['text'],
+                                            'border': f'1px solid {COLORS["accent"]}'
                                         }
                                     ),
                                     width=6,
@@ -228,21 +339,31 @@ app.layout = dbc.Container(
                                         style={
                                             "height": "20px",
                                             "marginBottom": "10px",
-                                            "backgroundColor": "rgba(0, 0, 51, 0.7)",
-                                            "borderRadius": "10px",
+                                            "backgroundColor": "rgba(187, 134, 252, 0.2)",
+                                            "borderRadius": "4px",
                                         },
                                         className="mb-3",
+                                        color="secondary",
                                     ),
                                     html.Div(id="progress-text", style={
-                                        "color": VAPORWAVE_COLORS['text'],
+                                        "color": COLORS['text_secondary'],
                                         "textAlign": "center",
-                                        "marginBottom": "10px",
+                                        "marginBottom": "15px",
+                                        "fontSize": "0.9rem"
                                     }),
                                 ])
                             ]),
                             dcc.Store(id="progress-store", data={"current": 0, "total": 0}),
                             dcc.Interval(id='progress-interval', interval=500, disabled=True),  # 500ms interval
                             dcc.Store(id='processing-state', data={'processing': False, 'queue': [], 'current_row': 0, 'total_rows': 0}),
+                            html.H5(
+                                "Input Data",
+                                style={
+                                    'color': COLORS['primary'],
+                                    'fontWeight': '500',
+                                    'marginBottom': '15px'
+                                }
+                            ),
                             dag.AgGrid(
                                 id="ag-grid", 
                                 columnDefs=[], 
@@ -254,8 +375,43 @@ app.layout = dbc.Container(
                                         "filter": True
                                     }
                                 },
-                                className="ag-theme-alpine-dark"
+                                className="ag-theme-alpine-dark",
+                                style={"marginBottom": "20px"}
                             ),
+                            html.Button(
+                                "Run Structured Extraction", 
+                                id="run-extraction-button",
+                                style={
+                                    'backgroundColor': COLORS['secondary'],
+                                    'border': 'none',
+                                    'color': '#000',
+                                    'padding': '10px 20px',
+                                    'borderRadius': '4px',
+                                    'width': '100%',
+                                    'fontWeight': '500',
+                                    'cursor': 'pointer',
+                                    'transition': 'all 0.2s ease',
+                                    'marginBottom': '20px'
+                                }
+                            ),
+                            html.H5(
+                                "Extraction Results",
+                                style={
+                                    'color': COLORS['primary'],
+                                    'fontWeight': '500',
+                                    'marginBottom': '15px'
+                                }
+                            ),
+                            html.Div(id="column-summaries", style={
+                                "marginBottom": "10px",
+                                "padding": "10px",
+                                "background": "rgba(3, 218, 198, 0.1)",
+                                "borderRadius": "4px",
+                                "border": f"1px solid {COLORS['secondary']}",
+                                "display": "flex",
+                                "flexWrap": "wrap",
+                                "gap": "10px"
+                            }),
                             dag.AgGrid(
                                 id="ag-grid-out", 
                                 columnDefs=[], 
@@ -264,18 +420,21 @@ app.layout = dbc.Container(
                                     "defaultColDef": {
                                         "resizable": True,
                                         "sortable": True,
-                                        "filter": True
-                                    }
+                                        "filter": True,
+                                        "editable": True
+                                    },
+                                    "getRowId": "function(params) { return params.data.id || params.node.id; }"
                                 },
+                                dangerously_allow_code=True,
                                 className="ag-theme-alpine-dark"
                             ),
                         ],
                         style={
                             "padding": "20px",
-                            "background": "rgba(0, 0, 51, 0.5)",
-                            "borderRadius": "10px",
-                            "backdropFilter": "blur(5px)",
-                            "border": f"1px solid {VAPORWAVE_COLORS['accent']}"
+                            "background": COLORS['surface'],
+                            "borderRadius": "8px",
+                            "boxShadow": "0 4px 6px rgba(0, 0, 0, 0.1)",
+                            "border": f"1px solid {COLORS['accent']}"
                         },
                     ),
                 ],
@@ -294,7 +453,7 @@ def generate_chat_completions(n_clicks, input_value):
     if n_clicks is not None:
         # Make the OpenAI chat completions call with gpt-4o
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=get_model_name("gpt-4o"),
             messages=[
                 FUNCTION_CALLING_SYS_PROMPT,
                 *FUNCTION_CALLING_FEW_SHOTS_DICT,
@@ -314,8 +473,8 @@ def generate_chat_completions(n_clicks, input_value):
             schema_display = html.Div([
                 html.H5("Extraction Schema", 
                     style={
-                        'color': VAPORWAVE_COLORS['primary'],
-                        'textShadow': f'1px 1px {VAPORWAVE_COLORS["secondary"]}',
+                        'color': COLORS['primary'],
+                        'fontWeight': '500',
                         'marginBottom': '15px'
                     }
                 ),
@@ -323,60 +482,62 @@ def generate_chat_completions(n_clicks, input_value):
                     html.Div([
                         html.H6("Fields to Extract:", 
                             style={
-                                'color': VAPORWAVE_COLORS['secondary'],
-                                'marginBottom': '10px'
+                                'color': COLORS['secondary'],
+                                'marginBottom': '10px',
+                                'fontWeight': '500'
                             }
                         ),
                         html.Div([
                             html.Div([
                                 html.Strong(field, 
                                     style={
-                                        'color': VAPORWAVE_COLORS['accent'],
+                                        'color': COLORS['primary'],
                                         'marginRight': '10px'
                                     }
                                 ),
                                 html.Span(
                                     f"({properties.get('type', 'any')})",
-                                    style={'color': VAPORWAVE_COLORS['text'], 'fontSize': '0.9em'}
+                                    style={'color': COLORS['text_secondary'], 'fontSize': '0.9em'}
                                 ),
                                 html.Div(
                                     properties.get('description', ''),
-                                    style={'color': VAPORWAVE_COLORS['text'], 'fontSize': '0.8em', 'marginLeft': '20px'}
+                                    style={'color': COLORS['text'], 'fontSize': '0.8em', 'marginLeft': '20px'}
                                 )
                             ], 
                             style={
                                 'marginBottom': '10px',
                                 'padding': '10px',
-                                'background': 'rgba(0, 0, 51, 0.3)',
-                                'borderRadius': '5px',
-                                'border': f'1px solid {VAPORWAVE_COLORS["secondary"]}'
+                                'background': 'rgba(187, 134, 252, 0.1)',
+                                'borderRadius': '4px',
+                                'border': f'1px solid {COLORS["accent"]}'
                             })
                             for field, properties in schema_json['properties'].items()
                         ]),
                         html.H6("Required Fields:", 
                             style={
-                                'color': VAPORWAVE_COLORS['secondary'],
+                                'color': COLORS['secondary'],
                                 'marginTop': '15px',
-                                'marginBottom': '10px'
+                                'marginBottom': '10px',
+                                'fontWeight': '500'
                             }
                         ),
                         html.Div(
                             ", ".join(schema_json.get('required', [])),
                             style={
-                                'color': VAPORWAVE_COLORS['text'],
+                                'color': COLORS['text'],
                                 'padding': '10px',
-                                'background': 'rgba(0, 0, 51, 0.3)',
-                                'borderRadius': '5px',
-                                'border': f'1px solid {VAPORWAVE_COLORS["accent"]}'
+                                'background': 'rgba(3, 218, 198, 0.1)',
+                                'borderRadius': '4px',
+                                'border': f'1px solid {COLORS["secondary"]}'
                             }
                         )
                     ], 
                     style={
                         'padding': '15px',
-                        'background': 'rgba(0, 0, 51, 0.5)',
-                        'borderRadius': '10px',
-                        'backdropFilter': 'blur(5px)',
-                        'border': f'1px solid {VAPORWAVE_COLORS["accent"]}'
+                        'background': COLORS['surface'],
+                        'borderRadius': '8px',
+                        'boxShadow': '0 4px 6px rgba(0, 0, 0, 0.1)',
+                        'border': f'1px solid {COLORS["accent"]}'
                     })
                 ])
             ])
@@ -513,37 +674,71 @@ def process_next_batch(n_intervals, processing_state):
         # Only return empty state if we've never processed anything
         return [], [], 0, "", "", processing_state, True
 
-    # Process one row
+    # Process multiple rows in a batch
     if processing_state['queue']:
-        current_item = processing_state['queue'][0]
-        row = current_item['row']
+        # Define batch size - process up to 5 rows per interval
+        batch_size = min(5, len(processing_state['queue']))
+        batch_items = processing_state['queue'][:batch_size]
         
-        # Process the row
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Only provide results you want to extract"},
-                {"role": "user", "content": row[current_item['text_column']]},
-            ],
-            tools=current_item['tools'],
-            tool_choice={"type": "function", "function": {"name": current_item['function_name']}},
-        )
-        
-        tool_call = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
-        
-        # Update column definitions if needed
+        # Initialize data for batch processing
         column_defs = processing_state.get('column_defs', []).copy()
-        for key in tool_call.keys():
-            if key not in [col["field"] for col in column_defs]:
-                column_defs.append({"headerName": key, "field": key})
+        processed_rows = processing_state.get('processed_rows', []).copy()
         
-        # Add the processed row
-        processed_row = {**row, **tool_call}
-        processed_rows = processing_state.get('processed_rows', []) + [processed_row]
+        # Keep track of which columns are extracted and which are original
+        extracted_columns = set()
+        
+        # Process batch of rows in parallel using asyncio if supported
+        # For simplicity, we'll process them sequentially but in a batch
+        for current_item in batch_items:
+            row = current_item['row']
+            
+            try:
+                # Process the row
+                response = client.chat.completions.create(
+                    model=get_model_name("gpt-4o-mini"),
+                    messages=[
+                        {"role": "system", "content": "Only provide results you want to extract"},
+                        {"role": "user", "content": row[current_item['text_column']]},
+                    ],
+                    tools=current_item['tools'],
+                    tool_choice={"type": "function", "function": {"name": current_item['function_name']}},
+                )
+                
+                # Extract the tool call arguments from the API response
+                if response.choices and response.choices[0].message.tool_calls:
+                    tool_call = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+                    
+                    # Track which columns are extracted
+                    for key in tool_call.keys():
+                        extracted_columns.add(key)
+                        
+                        # Update column definitions if needed
+                        if key not in [col["field"] for col in column_defs]:
+                            col_def = {
+                                "headerName": key,
+                                "field": key,
+                            }
+                            column_defs.append(col_def)
+                    
+                    # Create a processed row that merges original data with extracted data
+                    processed_row = {**row}
+                    
+                    # Add extracted data to the row
+                    for key, value in tool_call.items():
+                        processed_row[key] = value
+                    
+                    processed_rows.append(processed_row)
+                else:
+                    # Handle case where no extraction was done (fallback)
+                    processed_rows.append(row)
+            except Exception as e:
+                print(f"Error processing row: {e}")
+                # Add the original row as a fallback if extraction fails
+                processed_rows.append(row)
         
         # Update processing state
-        new_queue = processing_state['queue'][1:]
-        current_row = processing_state['current_row'] + 1
+        new_queue = processing_state['queue'][batch_size:]
+        current_row = processing_state['current_row'] + batch_size
         total_rows = processing_state['total_rows']
         
         # Calculate progress
@@ -556,7 +751,8 @@ def process_next_batch(n_intervals, processing_state):
             'current_row': current_row,
             'total_rows': total_rows,
             'column_defs': column_defs,
-            'processed_rows': processed_rows
+            'processed_rows': processed_rows,
+            'extracted_columns': list(extracted_columns)
         }
         
         return (
@@ -589,16 +785,57 @@ def process_next_batch(n_intervals, processing_state):
 def update_upload_text(contents, filename):
     if contents is not None:
         return html.Div([
-            html.I(className="fas fa-file-alt", style={'marginRight': '10px', 'color': VAPORWAVE_COLORS['secondary']}),
+            html.I(className="fas fa-file-alt", style={'marginRight': '10px', 'color': COLORS['secondary']}),
             f"Loaded: {filename}",
-            html.Span(" (click or drag to replace)", style={'fontSize': '0.8em', 'color': VAPORWAVE_COLORS['accent']})
+            html.Span(" (click or drag to replace)", style={'fontSize': '0.8em', 'color': COLORS['text_secondary']})
         ])
     return html.Div([
         "Drag and Drop or ",
-        html.A("Select CSV Files", style={'color': VAPORWAVE_COLORS['primary']})
+        html.A("Select CSV Files", style={'color': COLORS['primary']})
     ])
 
 
+# Hidden div to store column summary data
+app.layout.children.append(html.Div(id="js-column-summaries", style={"display": "none"}))
+
+# Interval for updating column summaries
+app.layout.children.append(dcc.Interval(id="summaries-interval", interval=500, n_intervals=0))
+
+# Callback to update column summaries display
+@app.callback(
+    Output("column-summaries", "children"),
+    [Input("summaries-interval", "n_intervals"), Input("js-column-summaries", "children")]
+)
+def update_column_summaries(n_intervals, summaries_json):
+    if not summaries_json:
+        return []
+    
+    try:
+        # Parse the JSON data
+        summaries = json.loads(summaries_json)
+        elements = []
+        
+        # Create a summary element for each column
+        for col_id, summary in summaries.items():
+            if col_id and summary:
+                percentage = round(summary.get("fraction", 0) * 100)
+                
+                summary_div = html.Div(
+                    [
+                        html.Strong(f"{col_id}: "),
+                        html.Span(f"{summary.get('checked', 0)}/{summary.get('total', 0)}"),
+                        html.Span(f" ({percentage}%)", style={"marginLeft": "5px"})
+                    ],
+                    className="column-summary"
+                )
+                
+                elements.append(summary_div)
+        
+        return elements
+    except Exception as e:
+        print(f"Error updating summaries: {e}")
+        return []
+
 # Run the app
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    app.run(debug=True)

@@ -1,0 +1,45 @@
+/* Column summary styles */
+.column-summary {
+    padding: 8px 12px;
+    margin: 4px;
+    background-color: rgba(3, 218, 198, 0.1);
+    border: 1px solid #03DAC6;
+    border-radius: 4px;
+    display: inline-block;
+    font-size: 0.9em;
+}
+
+/* Checkbox cell styles */
+.checkbox-cell {
+    display: flex;
+    align-items: center;
+}
+
+.cell-checkbox {
+    margin-right: 8px;
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: #03DAC6;
+}
+
+.cell-value {
+    color: #B0B0B0;
+    font-size: 0.9em;
+}
+
+/* Custom ag-Grid overrides */
+.ag-theme-alpine-dark .ag-header-cell-label {
+    color: #BB86FC;
+    font-weight: 500;
+}
+
+.ag-theme-alpine-dark .ag-cell {
+    padding: 8px;
+}
+
+/* Animation for hover effect */
+.checkbox-cell:hover .cell-value {
+    color: #FFFFFF;
+    transition: color 0.2s ease;
+}
